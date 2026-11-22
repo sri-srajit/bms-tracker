@@ -1,0 +1,36 @@
+name: BookMyShow Ticket Tracker
+
+on:
+  schedule:
+    # Runs every 15 minutes (UTC)
+    - cron: "*/15 * * * *"
+  workflow_dispatch: # Allows manual test runs from the GitHub Actions tab
+
+jobs:
+  check-tickets:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Restore notified shows cache
+        uses: actions/cache@v4
+        with:
+          path: bms_notified_shows.json
+          key: bms-state-${{ github.run_id }}
+          restore-keys: |
+            bms-state-
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests beautifulsoup4 curl_cffi
+
+      - name: Run BookMyShow tracker once
+        run: python3 bms_ticket_tracker.py --once
