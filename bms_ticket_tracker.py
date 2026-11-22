@@ -30,6 +30,7 @@ Usage:
 
 import argparse
 import json
+import os
 import re
 import time
 from datetime import datetime
@@ -53,12 +54,12 @@ except ImportError:
 # ==============================================================================
 
 # 1. Phone Notification (ntfy.sh) — change this to a private, unique topic name!
-NTFY_TOPIC = "bms-hyd-tickets-change-me"
-NTFY_SERVER = "https://ntfy.sh"
+NTFY_TOPIC = os.getenv("NTFY_TOPIC", "bms-hyd-tickets-change-me")
+NTFY_SERVER = os.getenv("NTFY_SERVER", "https://ntfy.sh")
 
 # 2. Optional: Telegram Bot (leave blank if using ntfy.sh)
-TELEGRAM_BOT_TOKEN = ""
-TELEGRAM_CHAT_ID = ""
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
 # 3. Check Interval (15 minutes)
 CHECK_INTERVAL_SECONDS = 15 * 60
