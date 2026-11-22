@@ -33,4 +33,7 @@ jobs:
           pip install requests beautifulsoup4 curl_cffi
 
       - name: Run BookMyShow tracker once
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: python3 bms_ticket_tracker.py --once
