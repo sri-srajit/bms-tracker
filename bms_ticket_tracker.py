@@ -2,7 +2,7 @@
 """
 BookMyShow Ticket Availability Tracker (Hyderabad)
 --------------------------------------------------
-Monitors BookMyShow every 15 minutes for:
+Monitors BookMyShow using headless Chromium (Playwright) for:
   - Movies: Avengers: Doomsday, Dune: Part Three (Dune 3)
   - Language: English
   - Cinemas & Screens:
@@ -11,20 +11,18 @@ Monitors BookMyShow every 15 minutes for:
   - Dates: December 18, 19, and 20, 2026
 
 Phone Notifications:
-  Uses ntfy.sh (free, no account required).
-  1. Install the "ntfy" app on Android or iOS (https://ntfy.sh).
-  2. Subscribe to a unique topic name in the app (e.g., "bms-hyd-alerts-9482").
-  3. Set NTFY_TOPIC below to that exact topic name.
-  (Optional Telegram bot support is also included below.)
+  Supports Telegram Bot (via TELEGRAM_BOT_TOKEN & TELEGRAM_CHAT_ID env vars)
+  and/or ntfy.sh (via NTFY_TOPIC env var).
 
 Dependencies:
-  pip install requests beautifulsoup4 curl_cffi
+  pip install requests beautifulsoup4 playwright
+  playwright install chromium
 
 Usage:
   Run continuously (checks every 15 minutes):
     python3 bms_ticket_tracker.py
 
-  Run once (useful for cron / Task Scheduler every 15 mins):
+  Run once (useful for cron / GitHub Actions every 15 mins):
     python3 bms_ticket_tracker.py --once
 """
 
@@ -39,25 +37,18 @@ from typing import Dict, List, Set
 
 import requests
 from bs4 import BeautifulSoup
-
-# Prefer curl_cffi to mimic a real browser TLS fingerprint (helps avoid Cloudflare 403s).
-try:
-    from curl_cffi import requests as cf_requests
-    HTTP_CLIENT = "curl_cffi"
-except ImportError:
-    cf_requests = None
-    HTTP_CLIENT = "requests"
+from playwright.sync_api import sync_playwright
 
 
 # ==============================================================================
-# CONFIGURATION — EDIT THESE BEFORE RUNNING
+# CONFIGURATION — SET VIA ENVIRONMENT VARIABLES / GITHUB SECRETS OR EDIT BELOW
 # ==============================================================================
 
-# 1. Phone Notification (ntfy.sh) — change this to a private, unique topic name!
+# 1. Phone Notification (ntfy.sh)
 NTFY_TOPIC = os.getenv("NTFY_TOPIC", "bms-hyd-tickets-change-me")
 NTFY_SERVER = os.getenv("NTFY_SERVER", "https://ntfy.sh")
 
-# 2. Optional: Telegram Bot (leave blank if using ntfy.sh)
+# 2. Telegram Bot (recommended: set via GitHub Secrets / env vars)
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
@@ -120,34 +111,10 @@ def save_notified_shows(notified: Set[str]) -> None:
     STATE_FILE.write_text(json.dumps(sorted(notified), indent=2), encoding="utf-8")
 
 
-def fetch_page(url: str) -> str:
-    headers = {
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/131.0.0.0 Safari/537.36"
-        ),
-        "Accept-Language": "en-IN,en;q=0.9",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    }
-
-    if HTTP_CLIENT == "curl_cffi" and cf_requests is not None:
-        resp = cf_requests.get(url, headers=headers, impersonate="chrome", timeout=25)
-    else:
-        resp = requests.get(url, headers=headers, timeout=25)
-
-    resp.raise_for_status()
-    return resp.text
-
-
 def extract_matching_shows(
     html: str, cinema: Dict, date_str: str
 ) -> List[Dict[str, str]]:
-    """
-    Parses the BookMyShow venue page HTML for matching movie + language + screen.
-    Note: BookMyShow's DOM/JSON structure can change; this checks both structured
-    showtime blocks and embedded page text/JSON.
-    """
+    """Parses the rendered BookMyShow venue page HTML for matching movie + language + screen."""
     matches: List[Dict[str, str]] = []
     soup = BeautifulSoup(html, "html.parser")
 
@@ -156,12 +123,9 @@ def extract_matching_shows(
     canonical = soup.find("link", rel="canonical")
     if canonical and canonical.get("href"):
         if date_str not in canonical["href"] and not canonical["href"].endswith(cinema["code"]):
-            # If canonical points to a different YYYYMMDD date, this date isn't live yet
             if re.search(r"/202\d{5}$", canonical["href"]) and not canonical["href"].endswith(date_str):
                 return []
 
-    # Strategy 1: Inspect movie listing blocks in the DOM
-    # BookMyShow venue pages group showtimes by movie container (`li.list` or `div` blocks)
     candidate_blocks = soup.select("li.list, div[data-movie-code], section, article")
     if not candidate_blocks:
         candidate_blocks = [soup]
@@ -179,9 +143,7 @@ def extract_matching_shows(
         screen_hit = any(sk in lower_text for sk in cinema["screen_keywords"])
 
         if movie_hit and lang_hit and screen_hit:
-            # Extract showtime strings like "07:30 PM" or "11:45 AM"
             times = re.findall(r"\b\d{1,2}:\d{2}\s*(?:AM|PM)\b", text, flags=re.IGNORECASE)
-            # Determine which movie matched
             matched_movie = (
                 "Avengers: Doomsday"
                 if ("avengers" in lower_text or "doomsday" in lower_text)
@@ -209,7 +171,6 @@ def extract_matching_shows(
 def send_phone_notification(title: str, message: str, click_url: str) -> None:
     sent = False
 
-    # 1. Send via ntfy.sh
     if NTFY_TOPIC and NTFY_TOPIC != "bms-hyd-tickets-change-me":
         try:
             resp = requests.post(
@@ -229,7 +190,6 @@ def send_phone_notification(title: str, message: str, click_url: str) -> None:
         except Exception as exc:
             log(f"Failed to send ntfy notification: {exc}")
 
-    # 2. Send via Telegram (if configured)
     if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
         try:
             tg_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
@@ -255,34 +215,65 @@ def send_phone_notification(title: str, message: str, click_url: str) -> None:
 
 
 def run_check(notified_shows: Set[str]) -> bool:
-    """Runs one full check across all cinemas and target dates. Returns True if new shows found."""
+    """Runs one full check across all cinemas and target dates using headless Chromium."""
     found_new = False
 
-    for date_str in TARGET_DATES:
-        for cinema in CINEMAS:
-            url = cinema["url_template"].format(date=date_str)
-            try:
-                html = fetch_page(url)
-                matches = extract_matching_shows(html, cinema, date_str)
-                for match in matches:
-                    if match["id"] not in notified_shows:
-                        found_new = True
-                        notified_shows.add(match["id"])
-                        title = f"Tickets Open: {match['movie']} ({match['date']})"
-                        body = (
-                            f"{match['movie']} (English) is available at {match['cinema']} "
-                            f"on {match['date']}.\nShowtimes: {match['times']}"
-                        )
-                        log(f"MATCH FOUND! {body}")
-                        send_phone_notification(title, body, match["url"])
-            except requests.HTTPError as exc:
-                status = exc.response.status_code if exc.response is not None else "?"
-                log(f"HTTP {status} for {cinema['code']} on {date_str} ({url})")
-            except Exception as exc:
-                log(f"Error checking {cinema['code']} on {date_str}: {exc}")
+    with sync_playwright() as p:
+        browser = p.chromium.launch(
+            headless=True,
+            args=["--disable-blink-features=AutomationControlled"],
+        )
+        context = browser.new_context(
+            user_agent=(
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/131.0.0.0 Safari/537.36"
+            ),
+            locale="en-IN",
+            timezone_id="Asia/Kolkata",
+            viewport={"width": 1366, "height": 768},
+        )
+        page = context.new_page()
+        page.add_init_script(
+            "Object.defineProperty(navigator, 'webdriver', {get: () => undefined});"
+        )
 
-            # Polite pause between requests
-            time.sleep(2)
+        for date_str in TARGET_DATES:
+            for cinema in CINEMAS:
+                url = cinema["url_template"].format(date=date_str)
+                try:
+                    resp = page.goto(url, wait_until="domcontentloaded", timeout=35000)
+                    status = resp.status if resp else 0
+                    # Give Cloudflare JS / client-side hydration a moment to settle
+                    page.wait_for_timeout(3500)
+                    html = page.content()
+
+                    if status == 403 or "just a moment" in html.lower() or "attention required" in html.lower():
+                        log(
+                            f"Blocked by Cloudflare (HTTP {status}) for {cinema['code']} "
+                            f"on {date_str}. (GitHub Actions datacenter IPs are often blocked; "
+                            f"try running locally if this persists.)"
+                        )
+                        continue
+
+                    matches = extract_matching_shows(html, cinema, date_str)
+                    for match in matches:
+                        if match["id"] not in notified_shows:
+                            found_new = True
+                            notified_shows.add(match["id"])
+                            title = f"Tickets Open: {match['movie']} ({match['date']})"
+                            body = (
+                                f"{match['movie']} (English) is available at {match['cinema']} "
+                                f"on {match['date']}.\nShowtimes: {match['times']}"
+                            )
+                            log(f"MATCH FOUND! {body}")
+                            send_phone_notification(title, body, match["url"])
+                except Exception as exc:
+                    log(f"Error checking {cinema['code']} on {date_str}: {exc}")
+
+                time.sleep(2)
+
+        browser.close()
 
     if found_new:
         save_notified_shows(notified_shows)
@@ -301,7 +292,7 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    log(f"Starting BookMyShow tracker (HTTP client: {HTTP_CLIENT})")
+    log("Starting BookMyShow tracker (HTTP client: Playwright Chromium)")
     notified_shows = load_notified_shows()
 
     if args.once:
